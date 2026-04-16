@@ -1,6 +1,6 @@
 __history/
 __recovery/
 *.~*
-/exe/
 *.local
 *.identcache
+exe/NV.exe.WebView2/

@@ -23,6 +23,9 @@ const
   ID_TRAY_SHOW      = 1001;
   ID_TRAY_EXIT      = 1002;
   ID_TRAY_AUTOSTART = 1003;
+  ID_TIMER_RETRY    = 2001;
+  ID_TIMER_TIMEOUT  = 2002;
+  NAVIGATION_TIMEOUT_MS = 30000;
 
   MUTEX_NAME    = 'NanoView.SingleInstance.'+ CLASS_NAME;
   SHOW_MSG_NAME = 'NanoView.ShowInstance.'+ CLASS_NAME;
@@ -57,8 +60,125 @@ var
   WasMaximized: Boolean = False;
   SingleInstanceMutex: THandle = 0;
   WM_SHOW_INSTANCE: UINT = 0;
+  UserDataFolder: string;
+  PageLoaded: Boolean = False;
+  NavigationRetries: Integer = 0;
 
 function CreateCoreWebView2EnvironmentWithOptions(browserExecutableFolder: PWideChar; userDataFolder: PWideChar; environmentOptions: ICoreWebView2EnvironmentOptions; environmentCreatedHandler: ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler): HRESULT; stdcall; external 'WebView2Loader.dll';
+
+function SHGetFolderPathW(hwndOwner: HWND; nFolder: Integer; hToken: THandle; dwFlags: DWORD; pszPath: PWideChar): HRESULT; stdcall; external 'shell32.dll';
+function ConvertSidToStringSidW(Sid: Pointer; var StringSid: PWideChar): BOOL; stdcall; external 'advapi32.dll';
+function ConvertStringSecurityDescriptorToSecurityDescriptorW(StringSecurityDescriptor: PWideChar; StringSDRevision: DWORD; var SecurityDescriptor: Pointer; SecurityDescriptorSize: PDWORD): BOOL; stdcall; external 'advapi32.dll';
+function GetSecurityDescriptorDacl(pSecurityDescriptor: Pointer; var lpbDaclPresent: BOOL; var pDacl: Pointer; var lpbDaclDefaulted: BOOL): BOOL; stdcall; external 'advapi32.dll';
+function SetNamedSecurityInfoW(pObjectName: PWideChar; ObjectType: Integer; SecurityInfo: DWORD; psidOwner: Pointer; psidGroup: Pointer; pDacl: Pointer; pSacl: Pointer): DWORD; stdcall; external 'advapi32.dll';
+
+const
+  CSIDL_LOCAL_APPDATA                 = $001C;
+  SE_FILE_OBJECT                      = 1;
+  PROTECTED_DACL_SECURITY_INFORMATION = DWORD($80000000);
+  SDDL_REVISION_1                     = 1;
+
+type
+  PTokenUserRec = ^TTokenUserRec;
+  TTokenUserRec = record
+    Sid: Pointer;
+    Attributes: DWORD;
+  end;
+
+function DirExistsW(const Dir: string): Boolean;
+var
+  Attr: DWORD;
+begin
+  Attr := GetFileAttributesW(PWideChar(Dir));
+  Result := (Attr <> INVALID_FILE_ATTRIBUTES) and ((Attr and FILE_ATTRIBUTE_DIRECTORY) <> 0);
+end;
+
+function GetCurrentUserSidString: string;
+var
+  Token: THandle;
+  Size: DWORD;
+  Info: Pointer;
+  SidStr: PWideChar;
+begin
+  Result := '';
+  if not OpenProcessToken(GetCurrentProcess, TOKEN_QUERY, Token) then Exit;
+  try
+    Size := 0;
+    GetTokenInformation(Token, TokenUser, nil, 0, Size);
+    if Size = 0 then Exit;
+    GetMem(Info, Size);
+    try
+      if GetTokenInformation(Token, TokenUser, Info, Size, Size) then
+        if ConvertSidToStringSidW(PTokenUserRec(Info).Sid, SidStr) then
+        begin
+          Result := string(SidStr);
+          LocalFree(HLOCAL(SidStr));
+        end;
+    finally
+      FreeMem(Info);
+    end;
+  finally
+    CloseHandle(Token);
+  end;
+end;
+
+function BuildUserDataFolder: string;
+var
+  Buf: array[0..MAX_PATH - 1] of WideChar;
+begin
+  Result := '';
+  if SHGetFolderPathW(0, CSIDL_LOCAL_APPDATA, 0, 0, @Buf[0]) <> S_OK then Exit;
+  Result := string(PWideChar(@Buf[0]));
+  if (Result <> '') and (Result[Length(Result)] <> '\') then
+    Result := Result + '\';
+  Result := Result + CLASS_NAME;
+end;
+
+function EnsureSecureUserDataFolder(const Dir: string): Boolean;
+var
+  UserSid, Sddl: string;
+  SD, Dacl: Pointer;
+  DaclPresent, DaclDefaulted: BOOL;
+  SA: TSecurityAttributes;
+begin
+  Result := False;
+  if Dir = '' then Exit;
+
+  SD := nil;
+  UserSid := GetCurrentUserSidString;
+  if UserSid <> '' then
+  begin
+    Sddl := 'D:P(A;OICI;FA;;;' + UserSid + ')(A;OICI;FA;;;SY)';
+    if not ConvertStringSecurityDescriptorToSecurityDescriptorW(PWideChar(Sddl), SDDL_REVISION_1, SD, nil) then
+      SD := nil;
+  end;
+
+  try
+    if DirExistsW(Dir) then
+      Result := True
+    else
+    begin
+      if SD <> nil then
+      begin
+        SA.nLength := SizeOf(SA);
+        SA.lpSecurityDescriptor := SD;
+        SA.bInheritHandle := False;
+        Result := CreateDirectoryW(PWideChar(Dir), @SA);
+      end
+      else
+        Result := CreateDirectoryW(PWideChar(Dir), nil);
+      if not Result then Exit;
+    end;
+
+    if (SD <> nil) and GetSecurityDescriptorDacl(SD, DaclPresent, Dacl, DaclDefaulted) and DaclPresent then
+      SetNamedSecurityInfoW(PWideChar(Dir), SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION or PROTECTED_DACL_SECURITY_INFORMATION,
+        nil, nil, Dacl, nil);
+  finally
+    if SD <> nil then
+      LocalFree(HLOCAL(SD));
+  end;
+end;
 
 type
   TControllerHandler = class(TInterfacedObject, ICoreWebView2CreateCoreWebView2ControllerCompletedHandler)
@@ -81,6 +201,11 @@ type
     function Invoke(const sender: ICoreWebView2; const args: ICoreWebView2PermissionRequestedEventArgs): HRESULT; stdcall;
   end;
 
+  TNavigationCompletedHandler = class(TInterfacedObject, ICoreWebView2NavigationCompletedEventHandler)
+  public
+    function Invoke(const sender: ICoreWebView2; const args: ICoreWebView2NavigationCompletedEventArgs): HRESULT; stdcall;
+  end;
+
 procedure SetSizeWindow(Window: HWND; Ctrl: ICoreWebView2Controller; ZoomFactor: Double = 1);
 var
   r: tagRECT;
@@ -92,6 +217,15 @@ begin
   r.right := r2.Right;
   r.bottom := r2.Bottom;
   Ctrl.SetBoundsAndZoomFactor(r, 1.0);
+end;
+
+procedure StartNavigate(Wnd: HWND);
+begin
+  if WebView = nil then Exit;
+  KillTimer(Wnd, ID_TIMER_RETRY);
+  KillTimer(Wnd, ID_TIMER_TIMEOUT);
+  WebView.Navigate(URL);
+  SetTimer(Wnd, ID_TIMER_TIMEOUT, NAVIGATION_TIMEOUT_MS, nil);
 end;
 
 function TControllerHandler.Invoke(errorCode: HRESULT; const createdController: ICoreWebView2Controller): HRESULT;
@@ -110,9 +244,10 @@ begin
 
   WebView.add_WebMessageReceived(TWebMessageReceivedHandler.Create, Token);
   WebView.add_PermissionRequested(TPermissionRequestedHandler.Create, Token);
+  WebView.add_NavigationCompleted(TNavigationCompletedHandler.Create, Token);
   WebView.AddScriptToExecuteOnDocumentCreated(PWideChar(string(THEME_SCRIPT)), nil);
 
-  WebView.Navigate(URL);
+  StartNavigate(MainWindow);
 
   SetProcessWorkingSetSize(GetCurrentProcess, SIZE_T(-1), SIZE_T(-1));
 
@@ -128,6 +263,46 @@ begin
   end;
   createdEnvironment.CreateCoreWebView2Controller(MainWindow, TControllerHandler.Create);
   Result := S_OK;
+end;
+
+procedure ScheduleNavigationRetry(Wnd: HWND);
+var
+  Delay: DWORD;
+begin
+  case NavigationRetries of
+    0: Delay :=  5000;
+    1: Delay := 10000;
+    2: Delay := 20000;
+    3: Delay := 30000;
+  else
+    Delay := 60000;
+  end;
+  Inc(NavigationRetries);
+  KillTimer(Wnd, ID_TIMER_RETRY);
+  KillTimer(Wnd, ID_TIMER_TIMEOUT);
+  SetTimer(Wnd, ID_TIMER_RETRY, Delay, nil);
+end;
+
+function TNavigationCompletedHandler.Invoke(const sender: ICoreWebView2; const args: ICoreWebView2NavigationCompletedEventArgs): HRESULT;
+var
+  Success: Integer;
+begin
+  Result := S_OK;
+  if PageLoaded then Exit;
+
+  Success := 0;
+  if args <> nil then
+    args.Get_IsSuccess(Success);
+
+  if Success <> 0 then
+  begin
+    PageLoaded := True;
+    NavigationRetries := 0;
+    KillTimer(MainWindow, ID_TIMER_RETRY);
+    KillTimer(MainWindow, ID_TIMER_TIMEOUT);
+  end
+  else
+    ScheduleNavigationRetry(MainWindow);
 end;
 
 procedure SetDarkMode(Wnd: HWND; Enable: Boolean);
@@ -223,6 +398,12 @@ begin
   else
     ShowWindow(Wnd, SW_SHOW);
   SetForegroundWindow(Wnd);
+
+  if (not PageLoaded) and (WebView <> nil) then
+  begin
+    NavigationRetries := 0;
+    StartNavigate(Wnd);
+  end;
 end;
 
 function GetExePath: string;
@@ -306,7 +487,11 @@ begin
       if Assigned(AllowDarkModeForWindow) then
         AllowDarkModeForWindow(hwnd, True);
 
-      CreateCoreWebView2EnvironmentWithOptions(nil, nil, nil, TEnvironmentHandler.Create);
+      UserDataFolder := BuildUserDataFolder;
+      if (UserDataFolder <> '') and EnsureSecureUserDataFolder(UserDataFolder) then
+        CreateCoreWebView2EnvironmentWithOptions(nil, PWideChar(UserDataFolder), nil, TEnvironmentHandler.Create)
+      else
+        CreateCoreWebView2EnvironmentWithOptions(nil, nil, nil, TEnvironmentHandler.Create);
       Result := 0;
       Exit;
     end;
@@ -314,6 +499,21 @@ begin
     begin
       if Controller <> nil then
         SetSizeWindow(hwnd, Controller);
+      Result := 0;
+      Exit;
+    end;
+    WM_TIMER:
+    begin
+      if (wParam = ID_TIMER_RETRY) and not PageLoaded then
+      begin
+        KillTimer(hwnd, ID_TIMER_RETRY);
+        StartNavigate(hwnd);
+      end
+      else if (wParam = ID_TIMER_TIMEOUT) and not PageLoaded then
+      begin
+        KillTimer(hwnd, ID_TIMER_TIMEOUT);
+        ScheduleNavigationRetry(hwnd);
+      end;
       Result := 0;
       Exit;
     end;
